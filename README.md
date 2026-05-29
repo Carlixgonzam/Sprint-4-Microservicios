@@ -42,6 +42,94 @@ El endpoint `/dashboard/summary` es el núcleo del **ASR de latencia**: consulta
 
 ---
 
+## Arquitectura extendida (alineada con `context.md`)
+
+La arquitectura se extendió para cubrir la visión completa del `context.md`: orquestación con cola de trabajos, cache de reportes y servicios especializados de recolección y análisis. **Todos los componentes originales siguen funcionando igual** — los nuevos son aditivos.
+
+```
+Usuario autenticado (JWT con scopes + refresh tokens)
+   │
+   ▼
+[API Gateway :8000]  Node.js + Express
+   │   • JWT con permissions[] (read:own_resources, read:own_costs, admin:full…)
+   │   • Rate limiter + audit log → MongoDB
+   │
+   ├── POST /reports/generate ──┐
+   ├── GET  /reports/<uuid>  ───┤
+   │                            ▼
+   │                     [Orchestrator :8004]  FastAPI
+   │                        │  • Redis cache (TTL: monthly 24h / weekly 12h / daily 4h)
+   │                        │  • RabbitMQ producer + worker (cola report.request + DLQ)
+   │                        │
+   │                        ├─► [Inventory :8001]   → PostgreSQL
+   │                        ├─► [Collector :8005]   → MongoDB (time_series_metrics)
+   │                        ├─► [Analyzer  :8006]   → PostgreSQL (cost_analysis, recommendations)
+   │                        └─► [Notification :8003] (Java/Spring Boot)
+   │
+   ├── /inventory/*    ──► Inventory Service
+   ├── /reports/costs  ──► Report Service (legado)
+   └── /dashboard/summary ──► Inventory + Report en paralelo (ASR Latencia)
+```
+
+### Componentes nuevos
+
+| Servicio | Puerto | Tecnología | BD / Broker | Responsabilidad |
+|---|---|---|---|---|
+| `orchestrator-service` | 8004 | Python 3.11 + FastAPI | Redis + RabbitMQ | Recibe `POST /reports/generate`, consulta cache, encola y coordina el pipeline completo |
+| `collector-service` | 8005 | Python 3.11 + FastAPI | MongoDB (`time_series_metrics`) | Genera y almacena métricas de uso (CPU, memoria, network, disk I/O) |
+| `analyzer-service` | 8006 | Python 3.11 + FastAPI | PostgreSQL (`cost_analysis`, `recommendations`) | Aplica reglas de optimización (downsize, terminate, reserved instance) |
+| Redis 7 | 6379 | Nativo en `ec2-broker` | — | Cache de reportes con TTL diferenciado |
+| RabbitMQ 3 | 5672 + 15672 | Nativo en `ec2-broker` | — | Cola `report.request` + DLQ `dlq.failed` + management UI |
+
+### Flujo de generación de reporte (Cache miss)
+
+1. **Cliente** → `POST /reports/generate` al gateway (con JWT que tenga scope `read:own_costs`)
+2. **Gateway** valida JWT y permisos, inyecta `client_id` desde el JWT, escribe `audit_log`, llama al orchestrator
+3. **Orchestrator** busca en Redis la clave `report:{client}:{type}:{period}`
+   - **Cache hit** → retorna el reporte directamente (< 100 ms)
+   - **Cache miss** → publica mensaje en RabbitMQ `report.request` y retorna `{report_id, status: queued}`
+4. **Worker** (hilo de fondo del orchestrator) consume el mensaje y orquesta:
+   - `Inventory` → recursos del cliente
+   - `Collector` → genera métricas sintéticas en `time_series_metrics`
+   - `Analyzer` → calcula `cost_analysis` + lista de `recommendations`
+5. Guarda el reporte en Redis bajo dos claves (compuesta y por `report_id`) con TTL según `period`
+6. Notifica al `notification-service` (best-effort)
+7. **Cliente** hace polling: `GET /reports/<report_id>` → `processing` o reporte completo
+
+### Permisos JWT y scopes
+
+| Scope | Significado | Endpoints protegidos |
+|---|---|---|
+| `read:own_resources` | Ver inventario propio | `/inventory/*` |
+| `read:own_costs` | Ver costos / generar reportes | `/reports/*`, `/dashboard/summary`, `/notifications/*` |
+| `write:settings` | Modificar configuración | (reservado) |
+| `admin:full` | Bypass de todos los scopes | Todos |
+
+Roles disponibles vía `POST /auth/token` con body `{"username":"x","role":"admin"}`:
+- `user` → `[read:own_resources, read:own_costs]` (por defecto)
+- `admin` → todos los scopes
+
+> **Backward compatibility**: tokens legacy emitidos antes de este cambio (sin claim `permissions`) siguen funcionando. El gateway los acepta como si tuvieran todos los scopes.
+
+### Refresh tokens
+
+`POST /auth/refresh` con body `{"refresh_token":"..."}` retorna un nuevo access token sin reenviar credenciales.
+
+- **Access TTL**: 1 hora
+- **Refresh TTL**: 7 días
+
+### Audit log
+
+El gateway escribe a la colección MongoDB `audit_log` (fire-and-forget — nunca bloquea el request) los siguientes eventos:
+- `token_issued`, `token_refreshed`, `refresh_failed`
+- `invalid_token`, `forbidden` (scope insuficiente)
+- `rate_limit_blocked`
+- `report_generate` (inicio de generación)
+
+Estructura del documento: `{ action, actor, client_id, ip, path, status, timestamp }`.
+
+---
+
 ## Microservicios
 
 | Servicio | Puerto | Tecnología | BD | Responsabilidad |
@@ -49,7 +137,7 @@ El endpoint `/dashboard/summary` es el núcleo del **ASR de latencia**: consulta
 | `api-gateway` | 8000 | Node.js 18 + Express | — | Punto de entrada único, JWT, rate limiting, proxy |
 | `inventory-service` | 8001 | Python 3.11 + FastAPI | PostgreSQL | Inventario de recursos cloud por empresa/proyecto |
 | `report-service` | 8002 | Python 3.11 + FastAPI | MongoDB | Reportes de costos y patrones de desperdicio |
-| `notification-service` | 8003 | Python 3.11 + FastAPI | — (en memoria) | Jobs asíncronos, notificación por email simulada |
+| `notification-service` | 8003 | **Java 21 + Spring Boot 3.3** | — (en memoria) | Jobs asíncronos, notificación por email simulada |
 
 ### Endpoints principales
 
@@ -175,6 +263,8 @@ Cuando un análisis supera el umbral de 2 s, el `notification-service` recibe el
 ---
 
 ## Infraestructura AWS Academy
+
+> **Arquitectura base**: 6 EC2s (descritas a continuación). **Arquitectura extendida**: 9 EC2s — se agregan `ec2-broker` (Redis + RabbitMQ), `ec2-orchestrator` (orchestrator-service) y `ec2-analytics` (collector-service + analyzer-service co-localizados). El script `setup_all_ec2.sh` despliega las 9 instancias en un solo paso; déjalas vacías si solo quieres correr la arquitectura base.
 
 Se necesitan **6 instancias EC2 t2.micro** (cubiertas por el Free Tier de AWS Academy):
 

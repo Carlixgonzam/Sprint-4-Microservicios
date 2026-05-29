@@ -29,9 +29,14 @@ read_var "Install directory" "/opt/bite/api-gateway" APP_DIR
 
 print_section "Upstream Service URLs"
 print_info "These are the private IPs / hostnames of the other EC2 instances."
-read_var "Inventory Service URL" "http://localhost:8001" INVENTORY_URL
-read_var "Report Service URL"    "http://localhost:8002" REPORT_URL
+read_var "Inventory Service URL"    "http://localhost:8001" INVENTORY_URL
+read_var "Report Service URL"       "http://localhost:8002" REPORT_URL
 read_var "Notification Service URL" "http://localhost:8003" NOTIF_URL
+read_var "Orchestrator Service URL" "http://localhost:8004" ORCHESTRATOR_URL
+
+print_section "Audit Log Storage"
+print_info "MongoDB connection used by gateway to write audit_log (fire-and-forget)."
+read_var "MONGO_AUDIT_URL (mongodb://...)" "mongodb://<mongo-host>:27017" MONGO_AUDIT_URL
 
 print_section "Security"
 read_var "JWT Secret (min 32 chars recommended)" "" JWT_SECRET secret
@@ -43,6 +48,8 @@ print_summary \
   "INVENTORY_URL=${INVENTORY_URL}" \
   "REPORT_URL=${REPORT_URL}" \
   "NOTIF_URL=${NOTIF_URL}" \
+  "ORCHESTRATOR_URL=${ORCHESTRATOR_URL}" \
+  "MONGO_AUDIT_URL=${MONGO_AUDIT_URL}" \
   "JWT_SECRET=${JWT_SECRET}"
 
 confirm "Deploy api-gateway with these settings?" || { echo "Aborted."; exit 0; }
@@ -78,10 +85,12 @@ chown -R bite:bite "$APP_DIR"
 # ── Environment file ──────────────────────────────────────────────────────────
 print_step "Writing ${APP_DIR}/.env"
 {
-  printf 'JWT_SECRET=%s\n'      "$JWT_SECRET"
-  printf 'INVENTORY_URL=%s\n'   "$INVENTORY_URL"
-  printf 'REPORT_URL=%s\n'      "$REPORT_URL"
-  printf 'NOTIF_URL=%s\n'       "$NOTIF_URL"
+  printf 'JWT_SECRET=%s\n'        "$JWT_SECRET"
+  printf 'INVENTORY_URL=%s\n'     "$INVENTORY_URL"
+  printf 'REPORT_URL=%s\n'        "$REPORT_URL"
+  printf 'NOTIF_URL=%s\n'         "$NOTIF_URL"
+  printf 'ORCHESTRATOR_URL=%s\n'  "$ORCHESTRATOR_URL"
+  printf 'MONGO_AUDIT_URL=%s\n'   "$MONGO_AUDIT_URL"
 } > "${APP_DIR}/.env"
 chmod 640 "${APP_DIR}/.env"
 chown bite:bite "${APP_DIR}/.env"

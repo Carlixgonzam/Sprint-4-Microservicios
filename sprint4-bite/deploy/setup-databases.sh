@@ -146,8 +146,9 @@ print_step "Creating schema in '${PG_DB}'"
 sudo -u postgres psql --no-password -d "${PG_DB}" -v ON_ERROR_STOP=1 <<SQL
 -- Grant
 GRANT ALL PRIVILEGES ON DATABASE ${PG_DB} TO bite;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Table (matches inventory-service/models.py)
+-- ── Table: cloud_resources (matches inventory-service/models.py) ──────────────
 CREATE TABLE IF NOT EXISTS cloud_resources (
     id            SERIAL PRIMARY KEY,
     company       VARCHAR(100),
@@ -161,17 +162,90 @@ CREATE TABLE IF NOT EXISTS cloud_resources (
     monthly_cost  DOUBLE PRECISION  DEFAULT 0.0,
     created_at    TIMESTAMPTZ       DEFAULT NOW()
 );
-
--- Indexes (match seed_postgres.py + SQLAlchemy model index=True)
 CREATE INDEX IF NOT EXISTS ix_cloud_resources_id      ON cloud_resources (id);
 CREATE INDEX IF NOT EXISTS ix_cloud_resources_company ON cloud_resources (company);
 CREATE INDEX IF NOT EXISTS ix_cloud_resources_project ON cloud_resources (project);
 CREATE INDEX IF NOT EXISTS idx_company_project        ON cloud_resources (company, project);
-
--- Transfer ownership so bite user can insert/select
 ALTER TABLE cloud_resources OWNER TO bite;
+
+-- ── Table: clients (multi-tenancy) ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS clients (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name            VARCHAR(150) NOT NULL,
+    email           VARCHAR(150) UNIQUE,
+    aws_account_id  VARCHAR(50),
+    gcp_project_id  VARCHAR(100),
+    api_key_hash    VARCHAR(255),
+    status          VARCHAR(20) DEFAULT 'active',
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE clients OWNER TO bite;
+INSERT INTO clients (id, name, email, status)
+VALUES ('00000000-0000-0000-0000-000000000001', 'Demo Client', 'demo@bite.co', 'active')
+ON CONFLICT (id) DO NOTHING;
+
+-- ── Table: cost_analysis (matches analyzer-service/models.py) ─────────────────
+CREATE TABLE IF NOT EXISTS cost_analysis (
+    id                     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    client_id              VARCHAR(64) NOT NULL,
+    company                VARCHAR(100),
+    analysis_period_start  TIMESTAMP,
+    analysis_period_end    TIMESTAMP,
+    total_cost             NUMERIC(18, 2) DEFAULT 0,
+    total_cost_optimized   NUMERIC(18, 2) DEFAULT 0,
+    savings_potential      NUMERIC(18, 2) DEFAULT 0,
+    recommendations_count  NUMERIC(10, 0) DEFAULT 0,
+    created_at             TIMESTAMP DEFAULT NOW(),
+    analysis_data          JSONB DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS ix_cost_analysis_client_id ON cost_analysis (client_id);
+CREATE INDEX IF NOT EXISTS ix_cost_analysis_company   ON cost_analysis (company);
+ALTER TABLE cost_analysis OWNER TO bite;
+
+-- ── Enum types for recommendations ────────────────────────────────────────────
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'rec_priority') THEN
+    CREATE TYPE rec_priority AS ENUM ('low', 'medium', 'high');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'rec_status') THEN
+    CREATE TYPE rec_status   AS ENUM ('pending', 'implemented', 'dismissed');
+  END IF;
+END
+\$\$;
+
+-- ── Table: recommendations ────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS recommendations (
+    id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    cost_analysis_id     UUID NOT NULL REFERENCES cost_analysis(id) ON DELETE CASCADE,
+    resource_id          VARCHAR(100),
+    recommendation_type  VARCHAR(50),
+    description          TEXT,
+    estimated_savings    NUMERIC(12, 2) DEFAULT 0,
+    priority             rec_priority DEFAULT 'low',
+    status               rec_status   DEFAULT 'pending',
+    created_at           TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_recommendations_analysis ON recommendations (cost_analysis_id);
+CREATE INDEX IF NOT EXISTS ix_recommendations_resource ON recommendations (resource_id);
+ALTER TABLE recommendations OWNER TO bite;
+
+-- ── Table: jwt_tokens (for refresh token / revocation tracking) ───────────────
+CREATE TABLE IF NOT EXISTS jwt_tokens (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    client_id   UUID REFERENCES clients(id) ON DELETE CASCADE,
+    token_hash  VARCHAR(255) NOT NULL,
+    permissions JSONB DEFAULT '[]'::jsonb,
+    issued_at   TIMESTAMPTZ DEFAULT NOW(),
+    expires_at  TIMESTAMPTZ NOT NULL,
+    revoked     BOOLEAN DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS ix_jwt_tokens_client    ON jwt_tokens (client_id);
+CREATE INDEX IF NOT EXISTS ix_jwt_tokens_expires   ON jwt_tokens (expires_at);
+ALTER TABLE jwt_tokens OWNER TO bite;
 SQL
-print_success "Table cloud_resources + 4 indexes created"
+print_success "Tables created: cloud_resources, clients, cost_analysis, recommendations, jwt_tokens"
 
 # ── Restart & verify ──────────────────────────────────────────────────────────
 print_step "Restarting PostgreSQL"
@@ -250,22 +324,36 @@ if (db.getUser("bite") === null) {
 }
 
 // ── Collections (explicit creation before indexing) ───────────────────────────
-if (!db.getCollectionNames().includes("cost_reports")) {
-  db.createCollection("cost_reports");
-  print("[OK] cost_reports collection created");
-}
-if (!db.getCollectionNames().includes("monthly_summaries")) {
-  db.createCollection("monthly_summaries");
-  print("[OK] monthly_summaries collection created");
+const required = ["cost_reports", "monthly_summaries", "time_series_metrics", "audit_log"];
+const existing = db.getCollectionNames();
+for (const c of required) {
+  if (!existing.includes(c)) {
+    db.createCollection(c);
+    print("[OK] " + c + " collection created");
+  }
 }
 
-// ── Indexes (match seed_mongo.py + report-service query patterns) ─────────────
-db.cost_reports.createIndex({ company: -1 },                          { background: true });
-db.cost_reports.createIndex({ company: -1, project: -1 },             { background: true });
-db.cost_reports.createIndex({ month: -1 },                            { background: true });
-db.cost_reports.createIndex({ company: 1, project: 1, month: 1 },     { background: true });
-db.monthly_summaries.createIndex({ company: -1, month: -1 },          { background: true });
-print("[OK] indexes created on cost_reports + monthly_summaries");
+// ── Indexes (match seed_mongo.py + report/collector service query patterns) ──
+db.cost_reports.createIndex({ company: -1 });
+db.cost_reports.createIndex({ company: -1, project: -1 });
+db.cost_reports.createIndex({ month: -1 });
+db.cost_reports.createIndex({ company: 1, project: 1, month: 1 });
+db.monthly_summaries.createIndex({ company: -1, month: -1 });
+
+// time_series_metrics (collector-service)
+db.time_series_metrics.createIndex(
+  { client_id: 1, resource_id: 1, metric_name: 1, timestamp: -1 },
+  { name: "ix_client_resource_metric_ts" }
+);
+db.time_series_metrics.createIndex({ timestamp: -1 }, { name: "ix_ts" });
+
+// audit_log (gateway writes auth/rate-limit events)
+db.audit_log.createIndex({ client_id: 1, timestamp: -1 });
+db.audit_log.createIndex({ action: 1, timestamp: -1 });
+db.audit_log.createIndex({ status: 1, timestamp: -1 });
+db.audit_log.createIndex({ timestamp: -1 });
+
+print("[OK] indexes created on cost_reports, monthly_summaries, time_series_metrics, audit_log");
 MONGOJS
 print_success "Users, collections, and indexes bootstrapped"
 
