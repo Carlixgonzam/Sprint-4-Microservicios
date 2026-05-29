@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """attack.py — Experimento 2: ASR de Seguridad (rate-limiting)
-Ejecutar: python attack.py
-Salida:   security_results.csv
+Uso:
+  python attack.py                              # apunta a localhost:8000
+  python attack.py --host http://54.x.x.x:8000
+Salida: security_results.csv
 """
+import argparse
 import csv
 import time
 import numpy as np
 import requests
 from datetime import datetime
 
-BASE    = 'http://localhost:8000'
+parser = argparse.ArgumentParser()
+parser.add_argument('--host', default='http://localhost:8000',
+                    help='URL base del gateway (default: http://localhost:8000)')
+args = parser.parse_args()
+
+BASE    = args.host.rstrip('/')
 CSV_OUT = 'security_results.csv'
 
 # ── Fase 1: obtener JWT y resetear rate limiter ──────────────────────────────
