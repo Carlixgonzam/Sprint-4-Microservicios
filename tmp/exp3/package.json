@@ -1,0 +1,16 @@
+{
+  "name": "exp3-latency-asr",
+  "version": "1.0.0",
+  "description": "Experimento 3 — Latency ASR: Redis Cache-Aside",
+  "scripts": {
+    "gateway": "node gateway_cached.js",
+    "inventory": "node stub_inventory.js",
+    "report": "node stub_report.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0"
+  }
+}
